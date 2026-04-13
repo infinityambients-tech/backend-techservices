@@ -1,0 +1,14 @@
+[Unit]
+Description=Gunicorn instance to serve techservices
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/techservices
+Environment="PATH=/var/www/techservices/venv/bin"
+# Executing gunicorn with 4 workers, binding to port 8000
+ExecStart=/var/www/techservices/venv/bin/gunicorn --workers 4 --bind 127.0.0.1:8000 app:app
+
+[Install]
+WantedBy=multi-user.target
