@@ -1,8 +1,13 @@
 server {
     listen 80;
-    server_name api.twojadomena.pl; # Change this to your domain
+    server_name techservices.com.pl www.techservices.com.pl;
 
-    location / {
+    # Frontend is served by the web server (static files).
+    # Keep your existing root/index config here if you already have it.
+
+    # API -> Gunicorn (Flask). This must exist on BOTH :80 and :443 server blocks
+    # if you use HTTPS (Let's Encrypt / Certbot).
+    location /api/ {
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;

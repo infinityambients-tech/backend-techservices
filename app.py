@@ -3,6 +3,7 @@ from extensions import db, migrate, cors, jwt, mail, limiter
 import os
 from dotenv import load_dotenv
 from sqlalchemy import text
+from werkzeug.exceptions import HTTPException
 
 load_dotenv()
 
@@ -10,19 +11,12 @@ load_dotenv()
 def create_app():
     app = Flask(__name__)
 
-    # ── CONFIG ────────────────────────────────────────────
-    app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
-        'DATABASE_URL', 'sqlite:///app.db'
-    )
+    # ── Config ────────────────────────────────────────────
+    app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///app.db')
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-    app.config['SECRET_KEY'] = os.getenv(
-        'SECRET_KEY', 'dev-secret-key-change-in-prod'
-    )
-    app.config['JWT_SECRET_KEY'] = os.getenv(
-        'JWT_SECRET_KEY', 'jwt-secret-key-change-in-prod'
-    )
-    app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 86400
+    app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-prod')
+    app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'jwt-secret-key-change-in-prod')
+    app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 86400  # 24h
 
     # Mail
     app.config['MAIL_SERVER'] = os.getenv('MAIL_SERVER', 'smtp.gmail.com')
@@ -30,20 +24,18 @@ def create_app():
     app.config['MAIL_USE_TLS'] = True
     app.config['MAIL_USERNAME'] = os.getenv('MAIL_USERNAME')
     app.config['MAIL_PASSWORD'] = os.getenv('MAIL_PASSWORD')
-    app.config['MAIL_DEFAULT_SENDER'] = os.getenv(
-        'MAIL_DEFAULT_SENDER', 'noreply@techservices.pl'
-    )
+    app.config['MAIL_DEFAULT_SENDER'] = os.getenv('MAIL_DEFAULT_SENDER', 'noreply@techservices.pl')
 
-    # ── IMPORTANT FIX (CORS PROD READY) ───────────────────
+    # ── Extensions ────────────────────────────────────────
+    db.init_app(app)
+    migrate.init_app(app, db)
+
     cors.init_app(
         app,
-        resources={r"/api/*": {"origins": "*"}},
+        resources={r"/api/*": {"origins": "*", "methods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]}},
         supports_credentials=True
     )
 
-    # ── EXTENSIONS ────────────────────────────────────────
-    db.init_app(app)
-    migrate.init_app(app, db)
     jwt.init_app(app)
     mail.init_app(app)
     limiter.init_app(app)
@@ -61,7 +53,21 @@ def create_app():
     def expired_token_callback(jwt_header, jwt_payload):
         return {"error": "JWT token has expired"}, 401
 
-    # ── BLUEPRINTS ────────────────────────────────────────
+    # ── GLOBAL ERROR HANDLER (PATCH) ──────────────────────
+    @app.errorhandler(Exception)
+    def handle_exception(e):
+        if isinstance(e, HTTPException):
+            return {
+                "error": e.name,
+                "details": e.description,
+            }, e.code
+        return {
+            "error": "Server error",
+            "type": str(type(e).__name__),
+            "details": str(e)
+        }, 500
+
+    # ── Blueprints ────────────────────────────────────────
     from routes.auth import auth_bp
     from routes.offers import offers_bp
     from routes.reservations import reservation_bp
@@ -70,36 +76,59 @@ def create_app():
     from routes.contact import contact_bp
     from routes.payment import payment_bp
 
-    app.register_blueprint(auth_bp, url_prefix='/api/auth')
-    app.register_blueprint(offers_bp, url_prefix='/api/offers')
+    app.register_blueprint(auth_bp,        url_prefix='/api/auth')
+    app.register_blueprint(offers_bp,      url_prefix='/api/offers')
     app.register_blueprint(reservation_bp, url_prefix='/api/reservations')
-    app.register_blueprint(slots_bp, url_prefix='/api/slots')
-    app.register_blueprint(user_bp, url_prefix='/api/user')
-    app.register_blueprint(contact_bp, url_prefix='/api/contact')
-    app.register_blueprint(payment_bp, url_prefix='/api/payments')
+    app.register_blueprint(slots_bp,       url_prefix='/api/slots')
+    app.register_blueprint(user_bp,        url_prefix='/api/user')
+    app.register_blueprint(contact_bp,     url_prefix='/api/contact')
+    app.register_blueprint(payment_bp,     url_prefix='/api/payments')
 
-    # ── HEALTH CHECK ──────────────────────────────────────
+    # ── Health check ──────────────────────────────────────
     @app.route('/')
     def index():
-        return {
-            "message": "TECH.SERVICES API v2.0",
-            "status": "ok"
-        }
+        return {"message": "TECH.SERVICES API v2.0", "status": "ok"}
 
-    @app.route('/health')
-    def health():
-        return {"status": "healthy"}
+    # ── DEBUG ROUTES (PATCH) ──────────────────────────────
+    # Flask 3 removed `before_first_request`, so we print once on the first request.
+    _routes_printed = False
 
-    # ── DB INIT (SAFE FOR VPS) ────────────────────────────
+    @app.before_request
+    def _debug_routes_once():
+        nonlocal _routes_printed
+        if _routes_printed:
+            return None
+        _routes_printed = True
+
+        print("\nREGISTERED ROUTES:")
+        for rule in app.url_map.iter_rules():
+            print(f"{rule.endpoint:35s} -> {rule}")
+        print("\n")
+        return None
+
+    # ── DB INIT (SAFE PATCHED VERSION) ────────────────────
     with app.app_context():
-        db.create_all()
-        _ensure_sqlite_schema_compat()
-        _seed_offers_if_empty()
+        try:
+            db.create_all()
+
+            # schema fix safe
+            try:
+                _ensure_sqlite_schema_compat()
+            except Exception as e:
+                print("[schema-error]", e)
+
+            # seed safe
+            try:
+                _seed_offers_if_empty()
+            except Exception as e:
+                print("[seed-error]", e)
+
+        except Exception as e:
+            print("[startup-db-error]", e)
 
     return app
 
 
-# ── SEED OFFERS ──────────────────────────────────────────
 def _seed_offers_if_empty():
     from models import Offer
 
@@ -116,7 +145,7 @@ def _seed_offers_if_empty():
             ),
             Offer(
                 name='MVP Development',
-                description='Backend + Frontend + Deployment',
+                description='Prototype, Backend + Frontend, Deployment',
                 price_from=2000,
                 price_to=2000,
                 duration_label='2-4 tygodnie',
@@ -124,10 +153,18 @@ def _seed_offers_if_empty():
             ),
             Offer(
                 name='Full Scale System',
-                description='Systemy skalowalne, microservices',
+                description='Complex logic, Microservices, Scale',
                 price_from=5000,
                 price_to=None,
                 duration_label='2-3 miesiące',
+                is_active=True
+            ),
+            Offer(
+                name='Additional Services',
+                description='Indywidualne wyceny, dedykowane rozwiązania',
+                price_from=None,
+                price_to=None,
+                duration_label='Do ustalenia',
                 is_active=True
             ),
         ]
@@ -135,11 +172,13 @@ def _seed_offers_if_empty():
         for o in offers:
             db.session.add(o)
 
-        db.session.commit()
-        print("[seed] Default offers created")
+        try:
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            print("[seed-commit-error]", e)
 
 
-# ── SQLITE COMPAT (SAFE MIGRATION) ───────────────────────
 def _ensure_sqlite_schema_compat():
     if db.engine.url.get_backend_name() != 'sqlite':
         return
@@ -163,7 +202,7 @@ def _ensure_sqlite_schema_compat():
     _add_column_if_missing(
         "reservations",
         "payment_status",
-        "payment_status VARCHAR(20) DEFAULT 'unpaid'"
+        "payment_status VARCHAR(20) DEFAULT 'unpaid'",
     )
 
     _add_column_if_missing("payments", "tenant_id", "tenant_id VARCHAR(36)")
@@ -181,5 +220,7 @@ def _ensure_sqlite_schema_compat():
     _add_column_if_missing("offer_statistics", "updated_at", "updated_at DATETIME")
 
 
-# ── APP INSTANCE ─────────────────────────────────────────
 app = create_app()
+
+if __name__ == '__main__':
+    app.run(debug=True)
