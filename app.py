@@ -1,4 +1,6 @@
-from flask import Flask
+import logging
+from flask import Flask, request
+from werkzeug.middleware.proxy_fix import ProxyFix
 from extensions import db, migrate, cors, jwt, mail, limiter
 import os
 from dotenv import load_dotenv
@@ -11,20 +13,40 @@ load_dotenv()
 def create_app():
     app = Flask(__name__)
 
-    # ── Config ────────────────────────────────────────────
-    app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///app.db')
+    # ProxyFix dla Nginx (X-Forwarded-For, X-Forwarded-Proto itd.)
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+    # Setup logging
+    is_prod = os.getenv('FLASK_ENV') == 'production'
+    logging.basicConfig(
+        level=logging.INFO if is_prod else logging.DEBUG,
+        format='[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
+    )    # ── Config ────────────────────────────────────────────
+    # Helper for safe secrets (błędy na starcie w produkcji jeśli brakuje)
+    def get_env_var(name, default=None):
+        val = os.getenv(name)
+        if not val:
+            if is_prod and default is None:
+                raise ValueError(f"Missing required ENV var in production: {name}")
+            return default
+        return val
+
+    # Database: domyślnie sqlite w dev, ale w prod musi zczytać DATABASE_URL (np. postgres)
+    app.config['SQLALCHEMY_DATABASE_URI'] = get_env_var('DATABASE_URL', 'sqlite:///app.db')
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-    app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-prod')
-    app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'jwt-secret-key-change-in-prod')
+    
+    # Secrets
+    app.config['SECRET_KEY'] = get_env_var('SECRET_KEY', None if is_prod else 'dev-secret-key-change-in-prod')
+    app.config['JWT_SECRET_KEY'] = get_env_var('JWT_SECRET_KEY', None if is_prod else 'jwt-secret-key-change-in-prod')
     app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 86400  # 24h
 
     # Mail
-    app.config['MAIL_SERVER'] = os.getenv('MAIL_SERVER', 'smtp.gmail.com')
-    app.config['MAIL_PORT'] = int(os.getenv('MAIL_PORT', 587))
+    app.config['MAIL_SERVER'] = get_env_var('MAIL_SERVER', 'smtp.gmail.com')
+    app.config['MAIL_PORT'] = int(get_env_var('MAIL_PORT', 587))
     app.config['MAIL_USE_TLS'] = True
-    app.config['MAIL_USERNAME'] = os.getenv('MAIL_USERNAME')
-    app.config['MAIL_PASSWORD'] = os.getenv('MAIL_PASSWORD')
-    app.config['MAIL_DEFAULT_SENDER'] = os.getenv('MAIL_DEFAULT_SENDER', 'noreply@techservices.pl')
+    app.config['MAIL_USERNAME'] = get_env_var('MAIL_USERNAME', None if is_prod else 'dev@techservices.pl')
+    app.config['MAIL_PASSWORD'] = get_env_var('MAIL_PASSWORD', None if is_prod else 'dev-pass')
+    app.config['MAIL_DEFAULT_SENDER'] = get_env_var('MAIL_DEFAULT_SENDER', 'noreply@techservices.pl')
 
     # ── Extensions ────────────────────────────────────────
     db.init_app(app)
@@ -32,12 +54,18 @@ def create_app():
 
     cors.init_app(
         app,
-        resources={r"/api/*": {"origins": "*", "methods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]}},
+        resources={r"/api/*": {
+            "origins": ["https://techservices.com.pl"], 
+            "methods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
+        }},
         supports_credentials=True
     )
 
     jwt.init_app(app)
     mail.init_app(app)
+    
+    # Rate limiter
+    app.config["RATELIMIT_DEFAULT"] = "100 per minute"
     limiter.init_app(app)
 
     # ── JWT ERRORS ────────────────────────────────────────
@@ -61,10 +89,12 @@ def create_app():
                 "error": e.name,
                 "details": e.description,
             }, e.code
+            
+        app.logger.error(f"Server error: {str(e)}")
         return {
             "error": "Server error",
-            "type": str(type(e).__name__),
-            "details": str(e)
+            "type": str(type(e).__name__) if not is_prod else "Internal Error",
+            "details": "Internal Server Error" if is_prod else str(e)
         }, 500
 
     # ── Blueprints ────────────────────────────────────────
@@ -85,9 +115,9 @@ def create_app():
     app.register_blueprint(payment_bp,     url_prefix='/api/payments')
 
     # ── Health check ──────────────────────────────────────
-    @app.route('/')
-    def index():
-        return {"message": "TECH.SERVICES API v2.0", "status": "ok"}
+    @app.route('/api/health')
+    def health():
+        return {"status": "ok"}
 
     # ── DEBUG ROUTES (PATCH) ──────────────────────────────
     # Flask 3 removed `before_first_request`, so we print once on the first request.
@@ -96,7 +126,8 @@ def create_app():
     @app.before_request
     def _debug_routes_once():
         nonlocal _routes_printed
-        if _routes_printed:
+        # Wyłącz debugowanie route w środowisku produkcyjnym
+        if _routes_printed or is_prod:
             return None
         _routes_printed = True
 
@@ -222,5 +253,6 @@ def _ensure_sqlite_schema_compat():
 
 app = create_app()
 
+# Fallback development server (Production should use Gunicorn: gunicorn app:app --bind 0.0.0.0:5000)
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000)
