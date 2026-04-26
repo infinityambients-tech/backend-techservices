@@ -65,14 +65,18 @@ def create_app():
     migrate.init_app(app, db)
 
     # --- POPRAWKA 3: Production CORS ---
+   # W sekcji --- POPRAWKA 3: Production CORS ---
     cors.init_app(
         app,
         resources={r"/api/*": {
             "origins": [
                 "https://techservices.com.pl",
-                "https://www.techservices.com.pl"
+                "https://www.techservices.com.pl",
+                "http://localhost:5173", # Dodaj to dla testów lokalnych
+                "http://localhost:3000"
             ], 
-            "methods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
+            "methods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"]
         }},
         supports_credentials=True
     )
@@ -153,6 +157,15 @@ def create_app():
                 "route": str(rule)
             })
         return {"routes": routes}
+    
+    @app.route('/api/offers_debug')
+    def offers_debug():
+        from models import Offer
+        offers = Offer.query.all()
+        return {
+            "count": len(offers),
+            "offers": [{"id": o.id, "name": o.name} for o in offers]
+        }
 
     # Console debug once (only in dev)
     _routes_printed = False
