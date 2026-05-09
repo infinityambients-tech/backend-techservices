@@ -1,120 +1,115 @@
 import logging
 import os
 from dotenv import load_dotenv
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from sqlalchemy import text
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+# Importy rozszerzeń i modeli
 from extensions import db, migrate, cors, jwt, mail, limiter
 
+# 1. Załadowanie .env na samym początku, przed jakąkolwiek logiką
 load_dotenv()
 
 def create_app():
     app = Flask(__name__)
 
-    # --- POPRAWKA 1: Flask slash routing ---
-    # Pozwala na obsługę endpointów zarówno z / na końcu, jak i bez (np. /api/offers i /api/offers/)
-    app.url_map.strict_slashes = False
+    # --- KONFIGURACJA ŚCIEŻEK (Kluczowe dla home.pl VPS) ---
+    # Wymuszamy pełną ścieżkę, aby uniknąć problemu "pustej bazy"
+    BASE_DIR = "/var/www/techservices/backend-techservices"
+    INSTANCE_PATH = os.path.join(BASE_DIR, 'instance')
+    DB_PATH = os.path.join(INSTANCE_PATH, 'app.db')
 
-    # --- POPRAWKA 4: Reverse proxy support & HTTPS ---
-    app.wsgi_app = ProxyFix(
-        app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1
-    )
-    app.config['PREFERRED_URL_SCHEME'] = 'https'
+    # Ustawienie ścieżki instancji dla Flaska
+    app.instance_path = INSTANCE_PATH
 
-    # Setup logging
+    # ===== AFTER REQUEST HEADER (Security) =====
+    @app.after_request
+    def add_header(response):
+        response.headers['Content-Security-Policy'] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-eval' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; "
+            "connect-src 'self' https://api.techservices.com.pl;"
+        )
+        return response
+
+    # --- POMOCNIK KONFIGURACJI ---
     is_prod = os.getenv('FLASK_ENV') == 'production'
-    logging.basicConfig(
-        level=logging.INFO if is_prod else logging.DEBUG,
-        format='[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
-    )
 
-    # Helper for safe secrets
     def get_env_var(name, default=None):
         val = os.getenv(name)
         if not val:
             if is_prod and default is None:
-                raise ValueError(f"Missing required ENV var in production: {name}")
+                return None # Pozwalamy na None, obsłużymy to niżej
             return default
         return val
 
-    # Database
-    app.config['SQLALCHEMY_DATABASE_URI'] = get_env_var('DATABASE_URL', 'sqlite:///app.db')
-    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    # --- PODSTAWOWE USTAWIENIA FLASKA ---
+    app.url_map.strict_slashes = False
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+    app.config['PREFERRED_URL_SCHEME'] = 'https'
+    app.config['SECRET_KEY'] = get_env_var('SECRET_KEY', 'dev-secret-key')
+
+    # --- DATABASE CONFIG (Fix: Wymuszona ścieżka absolutna) ---
+    # Nawet jeśli DATABASE_URL jest w .env, upewniamy się, że celuje w poprawne miejsce
+    env_db_url = os.getenv('DATABASE_URL')
+    if env_db_url and 'sqlite' in env_db_url:
+        app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:////{DB_PATH}'
+    else:
+        app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:////{DB_PATH}'
     
-    # Secrets
-    app.config['SECRET_KEY'] = get_env_var('SECRET_KEY', None if is_prod else 'dev-secret-key-change-in-prod')
-    app.config['JWT_SECRET_KEY'] = get_env_var('JWT_SECRET_KEY', None if is_prod else 'jwt-secret-key-change-in-prod')
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+    # JWT
+    app.config['JWT_SECRET_KEY'] = get_env_var('JWT_SECRET_KEY', 'jwt-dev-key')
     app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 86400  # 24h
 
-    # Mail
+    # --- MAIL CONFIG ---
     app.config['MAIL_SERVER'] = get_env_var('MAIL_SERVER', 'smtp.gmail.com')
     app.config['MAIL_PORT'] = int(get_env_var('MAIL_PORT', 587))
-    app.config['MAIL_USE_TLS'] = True
-    app.config['MAIL_USERNAME'] = get_env_var('MAIL_USERNAME', None if is_prod else 'dev@techservices.pl')
-    app.config['MAIL_PASSWORD'] = get_env_var('MAIL_PASSWORD', None if is_prod else 'dev-pass')
-    app.config['MAIL_DEFAULT_SENDER'] = get_env_var('MAIL_DEFAULT_SENDER', 'noreply@techservices.pl')
+    app.config['MAIL_USE_TLS'] = get_env_var('MAIL_USE_TLS', 'True') == 'True'
+    app.config['MAIL_USERNAME'] = get_env_var('MAIL_USERNAME')
+    app.config['MAIL_PASSWORD'] = get_env_var('MAIL_PASSWORD')
+    app.config['MAIL_DEFAULT_SENDER'] = get_env_var('MAIL_DEFAULT_SENDER')
 
     # Rate limiter
     app.config["RATELIMIT_DEFAULT"] = "100 per minute"
+    app.config["RATELIMIT_STORAGE_URI"] = "memory://"
 
-    # --- Extensions Init ---
+    # --- Inicjalizacja rozszerzeń ---
     db.init_app(app)
     migrate.init_app(app, db)
+    jwt.init_app(app)
+    mail.init_app(app)
+    limiter.init_app(app)
 
-    # --- POPRAWKA 3: Production CORS ---
-   # W sekcji --- POPRAWKA 3: Production CORS ---
+    # --- CORS (Z Twoimi domenami) ---
     cors.init_app(
         app,
         resources={r"/api/*": {
             "origins": [
                 "https://techservices.com.pl",
                 "https://www.techservices.com.pl",
-                "http://localhost:5173", # Dodaj to dla testów lokalnych
+                "http://localhost:5173",
                 "http://localhost:3000"
-            ], 
+            ],
             "methods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
             "allow_headers": ["Content-Type", "Authorization"]
         }},
         supports_credentials=True
     )
 
-    jwt.init_app(app)
-    mail.init_app(app)
-    limiter.init_app(app)
+    # Logging
+    logging.basicConfig(
+        level=logging.INFO if is_prod else logging.DEBUG,
+        format='[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
+    )
 
-    # --- JWT ERRORS ---
-    @jwt.unauthorized_loader
-    def unauthorized_callback(reason):
-        return {"error": "Missing or invalid Authorization header", "details": reason}, 401
-
-    @jwt.invalid_token_loader
-    def invalid_token_callback(reason):
-        return {"error": "Invalid JWT token", "details": reason}, 401
-
-    @jwt.expired_token_loader
-    def expired_token_callback(jwt_header, jwt_payload):
-        return {"error": "JWT token has expired"}, 401
-
-    # --- GLOBAL ERROR HANDLER ---
-    @app.errorhandler(Exception)
-    def handle_exception(e):
-        if isinstance(e, HTTPException):
-            return {
-                "error": e.name,
-                "details": e.description,
-            }, e.code
-            
-        app.logger.error(f"Server error: {str(e)}")
-        return {
-            "error": "Server error",
-            "type": str(type(e).__name__) if not is_prod else "Internal Error",
-            "details": "Internal Server Error" if is_prod else str(e)
-        }, 500
-
-    # --- Blueprints ---
+    # --- Rejestracja Blueprintów (Wszystkie 7 modułów) ---
     from routes.auth import auth_bp
     from routes.offers import offers_bp
     from routes.reservations import reservation_bp
@@ -123,133 +118,112 @@ def create_app():
     from routes.contact import contact_bp
     from routes.payment import payment_bp
 
-    app.register_blueprint(auth_bp,        url_prefix='/api/auth')
-    app.register_blueprint(offers_bp,      url_prefix='/api/offers')
+    app.register_blueprint(auth_bp, url_prefix='/api/auth')
+    app.register_blueprint(offers_bp, url_prefix='/api/offers')
     app.register_blueprint(reservation_bp, url_prefix='/api/reservations')
-    app.register_blueprint(slots_bp,       url_prefix='/api/slots')
-    app.register_blueprint(user_bp,        url_prefix='/api/user')
-    app.register_blueprint(contact_bp,     url_prefix='/api/contact')
-    app.register_blueprint(payment_bp,     url_prefix='/api/payments')
+    app.register_blueprint(slots_bp, url_prefix='/api/slots')
+    app.register_blueprint(user_bp, url_prefix='/api/user')
+    app.register_blueprint(contact_bp, url_prefix='/api/contact')
+    app.register_blueprint(payment_bp, url_prefix='/api/payments')
 
-    # --- POPRAWKA 5: Health + API Verification ---
-    @app.route('/api/health')
-    def health():
-        return {
-            "status": "ok",
-            "service": "techservices-api"
-        }
-
-    @app.route('/api/test')
-    def api_test():
-        return {
-            "status": "api online",
-            "proxy": "nginx active",
-            "scheme": request.scheme
-        }
-
-    # --- POPRAWKA 2: Routes Debug Endpoint ---
-    @app.route('/api/routes')
-    def list_routes():
-        routes = []
-        for rule in app.url_map.iter_rules():
-            routes.append({
-                "endpoint": rule.endpoint,
-                "route": str(rule)
-            })
-        return {"routes": routes}
-    
-    @app.route('/api/offers_debug')
-    def offers_debug():
+    # --- DIAGNOSTYKA ENDPOINT (Dla Ciebie do sprawdzenia bazy) ---
+    @app.route('/api/debug-db')
+    def debug_db():
         from models import Offer
-        offers = Offer.query.all()
-        return {
-            "count": len(offers),
-            "offers": [{"id": o.id, "name": o.name} for o in offers]
-        }
-
-    # Console debug once (only in dev)
-    _routes_printed = False
-    @app.before_request
-    def _debug_routes_once():
-        nonlocal _routes_printed
-        if _routes_printed or is_prod:
-            return None
-        _routes_printed = True
-        print("\nREGISTERED ROUTES:")
-        for rule in app.url_map.iter_rules():
-            print(f"{rule.endpoint:35s} -> {rule}")
-        print("\n")
-        return None
+        try:
+            count = Offer.query.count()
+            return jsonify({
+                "db_uri": app.config['SQLALCHEMY_DATABASE_URI'],
+                "db_exists": os.path.exists(DB_PATH),
+                "offers_count": count,
+                "db_path_used": DB_PATH
+            })
+        except Exception as e:
+            return jsonify({"error": str(e), "path": DB_PATH}), 500
 
     # --- DB INIT ---
     with app.app_context():
         try:
+            # Import modeli przed create_all
+            import models 
             db.create_all()
-            try:
-                _ensure_sqlite_schema_compat()
-            except Exception as e:
-                print("[schema-error]", e)
-            try:
-                _seed_offers_if_empty()
-            except Exception as e:
-                print("[seed-error]", e)
         except Exception as e:
-            print("[startup-db-error]", e)
+            app.logger.error(f"[startup-db-error] {str(e)}")
 
-    # --- POPRAWKA 6: Startup Log ---
-    app.logger.info('TechServices backend started successfully')
+    # --- GLOBAL ERROR HANDLERS ---
+    @app.errorhandler(400)
+    def bad_request(error):
+        """400 Bad Request"""
+        return jsonify({
+            "error": "Bad request",
+            "message": str(error.description) if hasattr(error, 'description') else "Invalid request format"
+        }), 400
+
+    @app.errorhandler(401)
+    def unauthorized(error):
+        """401 Unauthorized - Missing or invalid token"""
+        return jsonify({
+            "error": "Unauthorized",
+            "message": "Token jest wymagany lub jest nieprawidłowy"
+        }), 401
+
+    @app.errorhandler(403)
+    def forbidden(error):
+        """403 Forbidden - Insufficient permissions"""
+        return jsonify({
+            "error": "Forbidden",
+            "message": "Brak uprawnień do tego zasobu"
+        }), 403
+
+    @app.errorhandler(404)
+    def not_found(error):
+        """404 Not Found"""
+        return jsonify({
+            "error": "Not found",
+            "message": "Zasób nie został znaleziony"
+        }), 404
+
+    @app.errorhandler(429)
+    def rate_limit_exceeded(error):
+        """429 Too Many Requests"""
+        return jsonify({
+            "error": "Rate limit exceeded",
+            "message": "Zbyt wiele żądań. Spróbuj ponownie za chwilę."
+        }), 429
+
+    @app.errorhandler(500)
+    def internal_error(error):
+        """500 Internal Server Error"""
+        app.logger.error(f"[500 ERROR] {error}")
+        db.session.rollback()
+        return jsonify({
+            "error": "Internal server error",
+            "message": "Błąd serwera. Spróbuj ponownie później."
+        }), 500
+
+    @app.errorhandler(Exception)
+    def handle_exception(error):
+        """Catch all unhandled exceptions"""
+        app.logger.error(f"[UNHANDLED ERROR] {type(error).__name__}: {error}")
+        db.session.rollback()
+        
+        # Don't leak server details in production
+        if is_prod:
+            return jsonify({
+                "error": "Internal server error",
+                "message": "Coś poszło nie tak"
+            }), 500
+        else:
+            return jsonify({
+                "error": type(error).__name__,
+                "message": str(error)
+            }), 500
 
     return app
 
-
-def _seed_offers_if_empty():
-    from models import Offer
-    if Offer.query.count() == 0:
-        offers = [
-            Offer(name='Konsultacja Techniczna', description='Analiza architektury, code review, plan rozwoju', price_from=500, price_to=500, duration_label='1-2h', is_active=True, is_featured=True),
-            Offer(name='MVP Development', description='Prototype, Backend + Frontend, Deployment', price_from=2000, price_to=2000, duration_label='2-4 tygodnie', is_active=True),
-            Offer(name='Full Scale System', description='Complex logic, Microservices, Scale', price_from=5000, price_to=None, duration_label='2-3 miesiące', is_active=True),
-            Offer(name='Additional Services', description='Indywidualne wyceny, dedykowane rozwiązania', price_from=None, price_to=None, duration_label='Do ustalenia', is_active=True),
-        ]
-        for o in offers:
-            db.session.add(o)
-        try:
-            db.session.commit()
-        except Exception as e:
-            db.session.rollback()
-            print("[seed-commit-error]", e)
-
-
-def _ensure_sqlite_schema_compat():
-    if db.engine.url.get_backend_name() != 'sqlite':
-        return
-    def _table_columns(table_name):
-        rows = db.session.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
-        return {r[1] for r in rows}
-    def _add_column_if_missing(table_name, column_name, ddl):
-        cols = _table_columns(table_name)
-        if column_name in cols:
-            return
-        db.session.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {ddl}"))
-        db.session.commit()
-        print(f"[schema] Added column: {table_name}.{column_name}")
-
-    _add_column_if_missing("reservations", "payment_status", "payment_status VARCHAR(20) DEFAULT 'unpaid'")
-    _add_column_if_missing("payments", "tenant_id", "tenant_id VARCHAR(36)")
-    _add_column_if_missing("payments", "paypal_order_id", "paypal_order_id VARCHAR(255)")
-    _add_column_if_missing("payments", "paypal_payer_id", "paypal_payer_id VARCHAR(255)")
-    _add_column_if_missing("payments", "paypal_subscription_id", "paypal_subscription_id VARCHAR(255)")
-    _add_column_if_missing("payments", "currency", "currency VARCHAR(10) DEFAULT 'pln'")
-    _add_column_if_missing("payments", "status", "status VARCHAR(20) DEFAULT 'pending'")
-    _add_column_if_missing("payments", "created_at", "created_at DATETIME")
-    _add_column_if_missing("offers", "is_generated", "is_generated BOOLEAN DEFAULT 0")
-    _add_column_if_missing("offers", "source_offers", "source_offers TEXT")
-    _add_column_if_missing("offer_statistics", "views", "views INTEGER DEFAULT 0")
-    _add_column_if_missing("offer_statistics", "conversions", "conversions INTEGER DEFAULT 0")
-    _add_column_if_missing("offer_statistics", "updated_at", "updated_at DATETIME")
-
-
+# Tworzenie JEDYNEJ instancji aplikacji
 app = create_app()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    # Uruchomienie lokalne
+    app.run(host='0.0.0.0', port=5000, debug=True)

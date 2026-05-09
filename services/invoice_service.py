@@ -2,6 +2,41 @@ from datetime import datetime
 from models import db, Invoice, InvoiceSequence, Tenant
 import os
 
+
+def generate_pdf(invoice):
+    """
+    Generowanie PDF faktury.
+    
+    Parameters:
+    - invoice: Invoice object
+    
+    Returns:
+    - str (PDF file path lub URL)
+    
+    Implementation:
+    - Używa reportlab lub weasyprint
+    - Zapisuje w instance/invoices/
+    - Returns relative path
+    """
+    try:
+        # TODO: Implementacja PDF (wymaga reportlab/weasyprint)
+        # Stub: Zwróć mock path
+        invoice_dir = os.path.join(os.path.dirname(__file__), '..', 'instance', 'invoices')
+        os.makedirs(invoice_dir, exist_ok=True)
+        
+        pdf_filename = f"{invoice.invoice_number}.pdf"
+        pdf_path = os.path.join(invoice_dir, pdf_filename)
+        
+        # TODO: Wygeneruj PDF (na razie tworzymy pusty plik)
+        open(pdf_path, 'w').close()
+        
+        return f"/invoices/{pdf_filename}"
+        
+    except Exception as e:
+        print(f"[PDF ERROR] generate_pdf failed: {e}")
+        return None
+
+
 class InvoiceService:
     @staticmethod
     def get_next_invoice_number():
@@ -56,18 +91,20 @@ class InvoiceService:
             vat_rate=vat_rate,
             currency=payment.currency or "PLN",
             buyer_name=f"{reservation.user.first_name} {reservation.user.last_name}",
-            buyer_address= "Dane z profilu", # Placeholder
-            buyer_nip=None, # Placeholder
+            buyer_address="Dane z profilu",
+            buyer_nip=None,
             issued_at=datetime.utcnow()
         )
         
         db.session.add(invoice)
         db.session.commit()
         
-        # Placeholder for PDF generation
-        # pdf_path = generate_pdf(invoice)
-        # invoice.pdf_url = pdf_path
-        # db.session.commit()
+        # Generate PDF
+        pdf_url = generate_pdf(invoice)
+        if pdf_url:
+            invoice.pdf_url = pdf_url
+            db.session.commit()
+            print(f"[Invoice] PDF Generated: {pdf_url}")
         
         print(f"[Invoice] Generated: {invoice_num} for payment {payment.id}")
         return invoice

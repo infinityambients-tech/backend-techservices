@@ -1,3 +1,5 @@
+from flask import json
+
 from extensions import db
 from datetime import datetime
 import uuid
@@ -16,7 +18,7 @@ class User(db.Model):
     __tablename__ = 'users'
 
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    tenant_id = db.Column(db.String(36), db.ForeignKey('tenants.id'), nullable=True) # For multi-tenancy
+    tenant_id = db.Column(db.String(36), db.ForeignKey('tenants.id'), nullable=True)
     email = db.Column(db.String(255), unique=True, nullable=False)
     password_hash = db.Column(db.Text, nullable=False)
 
@@ -24,10 +26,14 @@ class User(db.Model):
     last_name = db.Column(db.String(100))
     phone = db.Column(db.String(50))
 
-    role = db.Column(db.String(20), default='user')      # user / admin
+    role = db.Column(db.String(20), default='user')
     is_verified = db.Column(db.Boolean, default=False)
+    
+    # --- DODAJ TO POLE ---
+    verification_token = db.Column(db.String(100), nullable=True)
+    # ---------------------
+    
     failed_attempts = db.Column(db.Integer, default=0)
-
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     reservations = db.relationship('Reservation', back_populates='user', lazy=True)
@@ -61,14 +67,15 @@ class Offer(db.Model):
     price_from = db.Column(db.Integer)
     price_to = db.Column(db.Integer)
     duration_days = db.Column(db.Integer)
-    duration_label = db.Column(db.String(100))   # e.g. "2-4 tygodnie"
+    duration_label = db.Column(db.String(100))
 
     is_active = db.Column(db.Boolean, default=True)
     is_featured = db.Column(db.Boolean, default=False)
     is_generated = db.Column(db.Boolean, default=False)
-    source_offers = db.Column(db.Text, nullable=True) # JSON list of IDs
+    source_offers = db.Column(db.Text, nullable=True) 
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    # Relacje
     statistics = db.relationship('OfferStatistics', backref='offer', cascade="all, delete-orphan", uselist=False)
     reservations = db.relationship('Reservation', back_populates='offer', cascade="all, delete-orphan")
 
@@ -77,6 +84,19 @@ class Offer(db.Model):
 
     def to_dict(self):
         stats = self.statistics
+        
+        # Bezpieczne parsowanie JSON dla source_offers
+        source_offers_list = []
+        if self.source_offers:
+            try:
+                # Jeśli to już jest listą/słownikiem (niektóre bazy tak robią), nie ładuj
+                if isinstance(self.source_offers, str):
+                    source_offers_list = json.loads(self.source_offers)
+                else:
+                    source_offers_list = self.source_offers
+            except Exception:
+                source_offers_list = []
+
         return {
             'id': self.id,
             'name': self.name,
@@ -87,13 +107,17 @@ class Offer(db.Model):
             'is_active': self.is_active,
             'is_featured': self.is_featured,
             'is_generated': self.is_generated,
-            'source_offers': json.loads(self.source_offers) if self.source_offers else [],
+            'source_offers': source_offers_list,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'stats': {
                 'views': stats.views if stats else 0,
                 'conversions': stats.conversions if stats else 0,
                 'reservations_count': stats.reservations_count if stats else 0
-            } if stats else None
+            } if stats else {
+                'views': 0,
+                'conversions': 0,
+                'reservations_count': 0
+            }
         }
 
     def update_stats(self, stat_type):
